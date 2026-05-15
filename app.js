@@ -31,9 +31,11 @@ if (SIM_NAME) {
 function getNow() { return SIM_NOW ? new Date(SIM_NOW.getTime()) : new Date(); }
 
 // Fallback config — overridden by values in the `config` sheet tab once it loads.
+// Murph divergence from IronHike: no fixed start_iso/cutoff_iso. The FIRST row in the
+// laps tab is treated as the START signal (not a segment). cutoff = start + target_duration_min.
+// Tap workflow: 1 start tap + 22 segment taps = 23 taps total.
 const FALLBACK_CONFIG = {
-  start_iso:            "2026-05-16T08:00:00-04:00",
-  cutoff_iso:           "2026-05-16T09:30:00-04:00",
+  target_duration_min:  90,
   total_laps:           22,
   elevation_ft_per_lap: 0,
   athlete_name:         "Matt Ricci",
@@ -75,7 +77,7 @@ function configFromCsv(rows) {
     const k = (r[0] || "").trim();
     const v = (r[1] || "").trim();
     if (!k || k.toLowerCase() === "key") continue;
-    if (k === "total_laps" || k === "elevation_ft_per_lap") cfg[k] = Number(v);
+    if (k === "total_laps" || k === "elevation_ft_per_lap" || k === "target_duration_min") cfg[k] = Number(v);
     else cfg[k] = v;
   }
   return cfg;
@@ -119,17 +121,23 @@ const fmtInt = n => n.toLocaleString("en-US", { maximumFractionDigits: 0 });
 
 let chart = null;
 
-function render(cfg, laps) {
+function render(cfg, allRows) {
   const now = getNow();
-  const start = new Date(cfg.start_iso);
-  const cutoff = new Date(cfg.cutoff_iso);
   const total = cfg.total_laps;
   const ft = cfg.elevation_ft_per_lap;
+  const targetMs = (cfg.target_duration_min || 90) * 60_000;
 
-  const done = laps.length;
+  // First row in the sheet is the START signal. Subsequent rows are segments.
+  // If sheet is empty, we're pre-start.
+  const startRow = allRows[0] || null;
+  const start = startRow ? startRow.t : null;
+  const segments = allRows.slice(1);
+  const cutoff = start ? new Date(start.getTime() + targetMs) : null;
+
+  const done = segments.length;
   const remainingLaps = Math.max(0, total - done);
-  const elapsedMs = now - start;
-  const cutoffMs  = cutoff - now;
+  const elapsedMs = start ? (now - start) : null;
+  const cutoffMs  = cutoff ? (cutoff - now) : null;
 
   document.getElementById("title").textContent = `Murph Test — ${cfg.athlete_name}`;
   document.getElementById("laps-done").textContent  = done;
@@ -146,69 +154,72 @@ function render(cfg, laps) {
   document.getElementById("percent").textContent = pct.toFixed(1) + "%";
   document.getElementById("progress-bar").style.width = Math.min(100, pct) + "%";
 
-  document.getElementById("elapsed").textContent   = elapsedMs > 0 ? fmtDur(elapsedMs) : "not started";
-  document.getElementById("remaining").textContent = cutoffMs > 0 ? fmtDur(cutoffMs) : "CUTOFF PASSED";
+  document.getElementById("elapsed").textContent   = start ? fmtDur(Math.max(0, elapsedMs)) : "awaiting start tap";
+  document.getElementById("remaining").textContent = !start ? "—" : cutoffMs > 0 ? fmtDur(cutoffMs) : "TARGET PASSED";
 
-  // Budget per lap (used for both the BUFFER projection and NEXT LAP DUE BY deadline).
-  const budgetMs = remainingLaps > 0 && cutoffMs > 0 ? cutoffMs / remainingLaps : null;
-  const actualMs = done > 0 && elapsedMs > 0 ? elapsedMs / done : null;
+  // Budget per segment (used for both the BUFFER projection and NEXT SEGMENT DUE BY).
+  const budgetMs = remainingLaps > 0 && cutoffMs != null && cutoffMs > 0 ? cutoffMs / remainingLaps : null;
+  const actualMs = done > 0 && elapsedMs != null && elapsedMs > 0 ? elapsedMs / done : null;
 
-  // BUFFER: projected finish vs cutoff, using cumulative pace.
+  // BUFFER: projected finish vs target, using cumulative pace.
   const bufferBox = document.getElementById("buffer-box");
   const bufferEl  = document.getElementById("buffer");
   const bufferNote = document.getElementById("buffer-note");
   bufferBox.classList.remove("good", "bad");
-  if (done === 0 || actualMs == null) {
+  if (!start) {
     bufferEl.textContent = "—";
-    bufferNote.textContent = "starts updating after lap 1";
+    bufferNote.textContent = "tap once to log start";
+  } else if (done === 0 || actualMs == null) {
+    bufferEl.textContent = "—";
+    bufferNote.textContent = "starts updating after segment 1";
   } else if (remainingLaps === 0) {
     bufferEl.textContent = "FINISHED";
     bufferBox.classList.add("good");
-    bufferNote.textContent = "at " + laps[laps.length-1].t.toLocaleString([], { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    bufferNote.textContent = "at " + segments[segments.length-1].t.toLocaleString([], { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
   } else if (cutoffMs <= 0) {
-    bufferEl.textContent = "CUTOFF PASSED";
+    bufferEl.textContent = "TARGET PASSED";
     bufferBox.classList.add("bad");
-    bufferNote.textContent = `${done}/${total} laps completed`;
+    bufferNote.textContent = `${done}/${total} segments completed`;
   } else {
     const projectedFinish = new Date(now.getTime() + remainingLaps * actualMs);
     const buf = cutoff - projectedFinish;
     bufferEl.textContent = (buf >= 0 ? "+" : "−") + fmtDur(Math.abs(buf)) + (buf >= 0 ? " ahead" : " behind");
     bufferBox.classList.add(buf >= 0 ? "good" : "bad");
-    bufferNote.textContent = "projected finish " + projectedFinish.toLocaleString([], { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    bufferNote.textContent = "projected finish " + projectedFinish.toLocaleString([], { hour: "numeric", minute: "2-digit" });
   }
 
-  // NEXT LAP DUE BY: wall-clock deadline for the next lap based on budget.
+  // NEXT SEGMENT DUE BY: wall-clock deadline for the next segment based on budget.
   const dueEl  = document.getElementById("due-by");
   const dueNote = document.getElementById("due-note");
-  if (remainingLaps === 0) {
+  if (!start) {
     dueEl.textContent = "—";
-    dueNote.textContent = "all laps complete";
+    dueNote.textContent = "awaiting start tap";
+  } else if (remainingLaps === 0) {
+    dueEl.textContent = "—";
+    dueNote.textContent = "all segments complete";
   } else if (cutoffMs <= 0) {
     dueEl.textContent = "—";
-    dueNote.textContent = "cutoff passed";
-  } else if (elapsedMs <= 0) {
-    dueEl.textContent = start.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-    dueNote.textContent = "event start";
+    dueNote.textContent = "target passed";
   } else {
     const dueAt = new Date(now.getTime() + budgetMs);
     dueEl.textContent = dueAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
     dueNote.textContent = `${fmtDur(budgetMs)} from now — your running budget`;
   }
 
-  // Last summit + status
+  // Last segment + status
   if (done > 0) {
-    const last = laps[laps.length - 1].t;
+    const last = segments[segments.length - 1].t;
     const since = now - last;
     document.getElementById("last-summit").textContent = fmtDur(since) + " ago";
     const isResting = since > REST_MIN * 60_000;
     document.getElementById("status").textContent = isResting ? `Resting — ${fmtDur(since)}` : "Active";
   } else {
     document.getElementById("last-summit").textContent = "—";
-    document.getElementById("status").textContent = elapsedMs < 0 ? "pre-event" : "waiting for lap 1";
+    document.getElementById("status").textContent = !start ? "awaiting start tap" : "waiting for segment 1";
   }
 
-  renderDupes(laps);
-  renderChart(start, cutoff, total, laps, now);
+  renderDupes(allRows);
+  renderChart(start, cutoff, total, segments, now);
 
   document.getElementById("updated").textContent =
     "updated " + now.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
@@ -231,19 +242,28 @@ function renderDupes(laps) {
   `;
 }
 
-function renderChart(start, cutoff, total, laps, now) {
+function renderChart(start, cutoff, total, segments, now) {
   const ctx = document.getElementById("chart");
 
-  // Step series: at each lap timestamp, cumulative count jumps to N.
+  // Pre-start: render an empty chart frame so the canvas isn't a blank gap.
+  if (!start || !cutoff) {
+    if (chart) {
+      chart.data.datasets = [];
+      chart.update("none");
+    }
+    return;
+  }
+
+  // Step series: at each segment timestamp, cumulative count jumps to N.
   const stepPts = [{ x: start, y: 0 }];
-  laps.forEach((lap, i) => {
+  segments.forEach((lap, i) => {
     stepPts.push({ x: lap.t, y: i });       // hold previous value to this point
     stepPts.push({ x: lap.t, y: i + 1 });   // then jump
   });
   // Extend horizontal line to "now" so the curve shows current standing.
-  if (laps.length > 0 && now > laps[laps.length - 1].t) {
-    stepPts.push({ x: now, y: laps.length });
-  } else if (laps.length === 0 && now > start) {
+  if (segments.length > 0 && now > segments[segments.length - 1].t) {
+    stepPts.push({ x: now, y: segments.length });
+  } else if (segments.length === 0 && now > start) {
     stepPts.push({ x: now, y: 0 });
   }
 
@@ -297,14 +317,14 @@ function renderChart(start, cutoff, total, laps, now) {
           type: "time",
           min: start,
           max: cutoff,
-          time: { unit: "hour", displayFormats: { hour: "EEE ha" } },
+          time: { unit: "minute", stepSize: 15, displayFormats: { minute: "h:mm a" } },
           ticks: { color: "#98a2af", font: { size: 10 }, maxRotation: 0, autoSkipPadding: 16 },
           grid: { color: "#262c34" },
         },
         y: {
           min: 0,
           max: total,
-          ticks: { color: "#98a2af", font: { size: 10 }, stepSize: 10 },
+          ticks: { color: "#98a2af", font: { size: 10 }, stepSize: total >= 30 ? 10 : 2 },
           grid: { color: "#262c34" },
         },
       },
@@ -351,10 +371,10 @@ async function installPushSubscribe() {
   const refresh = async () => {
     const sub = await reg.pushManager.getSubscription();
     if (sub) {
-      btn.textContent = "🔔 Subscribed — you'll get a push each lap";
+      btn.textContent = "🔔 Subscribed — you'll get a push each segment";
       btn.classList.add("subscribed");
     } else {
-      btn.textContent = "🔔 Get notified when Matt summits";
+      btn.textContent = "🔔 Get notified each Murph segment";
       btn.classList.remove("subscribed");
     }
     btn.hidden = false;

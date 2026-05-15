@@ -10,7 +10,7 @@ Project notes live in the Obsidian vault at `1 - Projects/2026 Murph Test/`.
 [iPhone Shortcut tap] → [Google Sheet row] → [published CSV] → [this static page]
 ```
 
-22 taps total: mile-1 + 20 Cindy-style rounds (5 pull-ups / 10 push-ups / 15 squats) + mile-2.
+**23 taps total**: 1 start tap (when you press GO) + 22 segment taps (mile-1, 20 Cindy-style rounds of 5 pull-ups / 10 push-ups / 15 squats, mile-2). The **first row** in the laps tab is treated as the start signal, not a segment — the dashboard derives `start = laps[0].t` and `cutoff = start + target_duration_min`. This is **start-time agnostic by design** so you don't have to commit to a start time in advance.
 
 ## Setup (one time)
 
@@ -31,9 +31,11 @@ If the Worker source ever needs editing, it lives in `ironhike-tracker/push-work
 ## Differences from ironhike-tracker
 
 - 22 segments instead of 49 laps
-- 90-min target window instead of 72-hour cutoff
+- **Derived start** — no `start_iso` in config; first row of `laps` tab is the start signal. `cutoff = start + target_duration_min`. IronHike has a fixed external cutoff so its config carries explicit `start_iso` / `cutoff_iso` instead.
+- `target_duration_min: 90` instead of `cutoff_iso`
 - `elevation_ft_per_lap = 0` — elevation row hidden on dashboard
 - `REST_MIN` lowered to 10, `DUP_SEC` lowered to 20 (Cindy rounds can be fast)
+- Chart x-axis uses minute ticks (15-min steps) instead of hour ticks
 - Push title/body/tag and dashboard copy updated for Murph
 - `push-worker/` and `sim/` directories removed (worker is reused; sim not needed for a 90-min rehearsal)
 
