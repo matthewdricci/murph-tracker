@@ -3,8 +3,8 @@
 // Rehearsal fork of ironhike-tracker. Same pipeline applied to a Murph workout
 // on Saturday May 16, 2026. 22 segments: mile-1 + 20 Cindy rounds + mile-2.
 // Push backend is shared with IronHike (same Cloudflare Worker, same secret).
-const PROD_LAPS_CSV_URL   = "REPLACE_WITH_MURPH_LAPS_CSV_URL";
-const PROD_CONFIG_CSV_URL = "REPLACE_WITH_MURPH_CONFIG_CSV_URL";
+const PROD_LAPS_CSV_URL   = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSSqCYGBu6Ro0ubVu0MfT7LoyThQhQT0yFnO6HmAk-Npa9A8K0OqoEYoxR_Ya1Qx6AEGb7GNvKHbKCx/pub?gid=1616123796&single=true&output=csv";
+const PROD_CONFIG_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSSqCYGBu6Ro0ubVu0MfT7LoyThQhQT0yFnO6HmAk-Npa9A8K0OqoEYoxR_Ya1Qx6AEGb7GNvKHbKCx/pub?gid=516113094&single=true&output=csv";
 
 const REFRESH_MS    = 60_000;
 const REST_MIN      = 10; // minutes between segments before status flips to "Resting" (Murph is short)
