@@ -2,97 +2,47 @@
 //
 // Rehearsal fork of ironhike-tracker. Same pipeline applied to a Murph workout
 // on Saturday May 16, 2026. 22 segments: mile-1 + 20 Cindy rounds + mile-2.
-// Push backend is shared with IronHike (same Cloudflare Worker, same secret).
-const PROD_LAPS_CSV_URL   = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSSqCYGBu6Ro0ubVu0MfT7LoyThQhQT0yFnO6HmAk-Npa9A8K0OqoEYoxR_Ya1Qx6AEGb7GNvKHbKCx/pub?gid=1616123796&single=true&output=csv";
-const PROD_CONFIG_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSSqCYGBu6Ro0ubVu0MfT7LoyThQhQT0yFnO6HmAk-Npa9A8K0OqoEYoxR_Ya1Qx6AEGb7GNvKHbKCx/pub?gid=516113094&single=true&output=csv";
+//
+// Backend: extended ironhike-push Cloudflare Worker. GET /laps?event=murph
+// returns JSON; shortcut POSTs /lap. No Google Sheets, no Zapier, no CSV
+// publish cache. Single source of truth in D1.
 
-const REFRESH_MS    = 60_000;
-const REST_MIN      = 10; // minutes between segments before status flips to "Resting" (Murph is short)
-const DUP_SEC       = 20; // consecutive timestamps closer than this look like accidental double-taps (Cindy rounds can be fast)
-
-// Web Push backend (self-hosted Cloudflare Worker).
-const PUSH_WORKER_URL  = "https://ironhike-push.beyond-the-hudson-918.workers.dev";
+const WORKER_URL       = "https://ironhike-push.beyond-the-hudson-918.workers.dev";
+const LAPS_API_URL     = WORKER_URL + "/laps?event=murph";
 const VAPID_PUBLIC_KEY = "BF9wwg-Dj93wNjIPdXisxSNg5wJpzHVD62Jag-HttBRiS1RZ1VmQgMvo0kTLHeFSrV9F7ca2xT0-PTQ42YxVqR0";
 
-// ---------- sim / time-travel ----------
+const REFRESH_MS = 15_000;  // worker is real-time; tighter refresh OK
+const REST_MIN   = 10;      // minutes between segments before status flips to "Resting"
+const DUP_SEC    = 20;      // segments closer than this look like accidental double-taps
+
+// Static config. No remote config tab anymore — these change rarely and live with the code.
+// Semantic model: every tap = +1 segment. First tap's timestamp = start.
+// Cutoff = start + target_duration_min. Done = laps.length.
+const CONFIG = {
+  target_duration_min: 90,
+  total_laps:          22,
+  athlete_name:        "Matt Ricci",
+};
+
+// ---------- time-travel (no sim files anymore) ----------
 const params = new URLSearchParams(location.search);
-const SIM_NAME = params.get("sim");
 let SIM_NOW = null;
 if (params.get("simNow")) {
   const d = new Date(params.get("simNow"));
   if (!isNaN(d)) SIM_NOW = d;
 }
-let LAPS_CSV_URL   = PROD_LAPS_CSV_URL;
-let CONFIG_CSV_URL = PROD_CONFIG_CSV_URL;
-if (SIM_NAME) {
-  LAPS_CSV_URL   = `./sim/${SIM_NAME}-laps.csv`;
-  CONFIG_CSV_URL = `./sim/${SIM_NAME}-config.csv`;
-}
 function getNow() { return SIM_NOW ? new Date(SIM_NOW.getTime()) : new Date(); }
 
-// Fallback config — overridden by values in the `config` sheet tab once it loads.
-// Murph divergence from IronHike: no fixed start_iso/cutoff_iso. The FIRST row in the
-// laps tab is treated as the START signal (not a segment). cutoff = start + target_duration_min.
-// Tap workflow: 1 start tap + 22 segment taps = 23 taps total.
-const FALLBACK_CONFIG = {
-  target_duration_min:  90,
-  total_laps:           22,
-  elevation_ft_per_lap: 0,
-  athlete_name:         "Matt Ricci",
-};
+// ---------- data ----------
 
-// ---------- CSV ----------
-
-async function fetchCsv(url) {
-  const r = await fetch(url + (url.includes("?") ? "&" : "?") + "cachebust=" + Date.now());
-  if (!r.ok) throw new Error("fetch " + url + " → " + r.status);
-  return parseCsv(await r.text());
-}
-
-function parseCsv(text) {
-  const rows = [];
-  let row = [], cell = "", inQ = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (inQ) {
-      if (c === '"' && text[i+1] === '"') { cell += '"'; i++; }
-      else if (c === '"') inQ = false;
-      else cell += c;
-    } else {
-      if (c === '"') inQ = true;
-      else if (c === ",") { row.push(cell); cell = ""; }
-      else if (c === "\n") { row.push(cell); rows.push(row); row = []; cell = ""; }
-      else if (c === "\r") { /* skip */ }
-      else cell += c;
-    }
-  }
-  if (cell.length || row.length) { row.push(cell); rows.push(row); }
-  return rows;
-}
-
-function configFromCsv(rows) {
-  const cfg = { ...FALLBACK_CONFIG };
-  for (const r of rows) {
-    if (!r || r.length < 2) continue;
-    const k = (r[0] || "").trim();
-    const v = (r[1] || "").trim();
-    if (!k || k.toLowerCase() === "key") continue;
-    if (k === "total_laps" || k === "elevation_ft_per_lap" || k === "target_duration_min") cfg[k] = Number(v);
-    else cfg[k] = v;
-  }
-  return cfg;
-}
-
-function lapsFromCsv(rows) {
-  const out = [];
-  for (const r of rows) {
-    if (!r || !r[0]) continue;
-    const ts = r[0].trim();
-    if (!ts || ts.toLowerCase().startsWith("timestamp")) continue;
-    const d = new Date(ts);
-    if (!isNaN(d)) out.push({ t: d, note: (r[1] || "").trim() });
-  }
-  return out.sort((a, b) => a.t - b.t);
+async function fetchLaps() {
+  const r = await fetch(LAPS_API_URL + "&cachebust=" + Date.now());
+  if (!r.ok) throw new Error("fetch " + LAPS_API_URL + " → " + r.status);
+  const body = await r.json();
+  return (body.laps || [])
+    .map(row => ({ id: row.id, t: new Date(row.timestamp_iso), note: row.note || "" }))
+    .filter(x => !isNaN(x.t))
+    .sort((a, b) => a.t - b.t);
 }
 
 // ---------- formatting ----------
@@ -110,31 +60,20 @@ function fmtDur(ms) {
   return `${sign}${m}m ${pad(s)}s`;
 }
 
-function fmtPerLap(ms) {
-  if (ms == null || isNaN(ms) || !isFinite(ms) || ms <= 0) return "—";
-  return "1 / " + fmtDur(ms);
-}
-
-const fmtInt = n => n.toLocaleString("en-US", { maximumFractionDigits: 0 });
-
 // ---------- render ----------
 
 let chart = null;
 
-function render(cfg, allRows) {
+function render(cfg, laps) {
   const now = getNow();
   const total = cfg.total_laps;
-  const ft = cfg.elevation_ft_per_lap;
-  const targetMs = (cfg.target_duration_min || 90) * 60_000;
+  const targetMs = cfg.target_duration_min * 60_000;
 
-  // First row in the sheet is the START signal. Subsequent rows are segments.
-  // If sheet is empty, we're pre-start.
-  const startRow = allRows[0] || null;
-  const start = startRow ? startRow.t : null;
-  const segments = allRows.slice(1);
+  // Semantic: every tap is a segment. Start = first tap's timestamp.
+  const start = laps.length > 0 ? laps[0].t : null;
   const cutoff = start ? new Date(start.getTime() + targetMs) : null;
 
-  const done = segments.length;
+  const done = laps.length;
   const remainingLaps = Math.max(0, total - done);
   const elapsedMs = start ? (now - start) : null;
   const cutoffMs  = cutoff ? (cutoff - now) : null;
@@ -142,40 +81,35 @@ function render(cfg, allRows) {
   document.getElementById("title").textContent = `Murph Test — ${cfg.athlete_name}`;
   document.getElementById("laps-done").textContent  = done;
   document.getElementById("laps-total").textContent = total;
-  // Elevation row repurposed: hide entirely when ft=0 (Murph has no elevation component).
-  const elevEl = document.getElementById("elevation");
-  if (ft > 0) {
-    elevEl.textContent = `${fmtInt(done * ft)} ft / ${fmtInt(total * ft)} ft`;
-    elevEl.hidden = false;
-  } else {
-    elevEl.hidden = true;
-  }
+  document.getElementById("elevation").hidden = true;
+
   const pct = total ? (done / total) * 100 : 0;
   document.getElementById("percent").textContent = pct.toFixed(1) + "%";
   document.getElementById("progress-bar").style.width = Math.min(100, pct) + "%";
 
-  document.getElementById("elapsed").textContent   = start ? fmtDur(Math.max(0, elapsedMs)) : "awaiting start tap";
+  document.getElementById("elapsed").textContent   = start ? fmtDur(Math.max(0, elapsedMs)) : "awaiting first tap";
   document.getElementById("remaining").textContent = !start ? "—" : cutoffMs > 0 ? fmtDur(cutoffMs) : "TARGET PASSED";
 
-  // Budget per segment (used for both the BUFFER projection and NEXT SEGMENT DUE BY).
   const budgetMs = remainingLaps > 0 && cutoffMs != null && cutoffMs > 0 ? cutoffMs / remainingLaps : null;
-  const actualMs = done > 0 && elapsedMs != null && elapsedMs > 0 ? elapsedMs / done : null;
+  const actualMs = done > 1 && elapsedMs > 0 ? elapsedMs / (done - 1) : null;
+  // ^ pace uses (done - 1) intervals between done timestamps, not done.
+  // At done=1 the elapsed is 0 (tap 1 IS the start), so no pace yet.
 
-  // BUFFER: projected finish vs target, using cumulative pace.
-  const bufferBox = document.getElementById("buffer-box");
-  const bufferEl  = document.getElementById("buffer");
+  // BUFFER
+  const bufferBox  = document.getElementById("buffer-box");
+  const bufferEl   = document.getElementById("buffer");
   const bufferNote = document.getElementById("buffer-note");
   bufferBox.classList.remove("good", "bad");
   if (!start) {
     bufferEl.textContent = "—";
-    bufferNote.textContent = "tap once to log start";
-  } else if (done === 0 || actualMs == null) {
+    bufferNote.textContent = "tap to log first segment";
+  } else if (done < 2 || actualMs == null) {
     bufferEl.textContent = "—";
-    bufferNote.textContent = "starts updating after segment 1";
+    bufferNote.textContent = "starts updating after segment 2";
   } else if (remainingLaps === 0) {
     bufferEl.textContent = "FINISHED";
     bufferBox.classList.add("good");
-    bufferNote.textContent = "at " + segments[segments.length-1].t.toLocaleString([], { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    bufferNote.textContent = "at " + laps[laps.length-1].t.toLocaleString([], { hour: "numeric", minute: "2-digit" });
   } else if (cutoffMs <= 0) {
     bufferEl.textContent = "TARGET PASSED";
     bufferBox.classList.add("bad");
@@ -188,12 +122,12 @@ function render(cfg, allRows) {
     bufferNote.textContent = "projected finish " + projectedFinish.toLocaleString([], { hour: "numeric", minute: "2-digit" });
   }
 
-  // NEXT SEGMENT DUE BY: wall-clock deadline for the next segment based on budget.
+  // NEXT SEGMENT DUE BY
   const dueEl  = document.getElementById("due-by");
   const dueNote = document.getElementById("due-note");
   if (!start) {
     dueEl.textContent = "—";
-    dueNote.textContent = "awaiting start tap";
+    dueNote.textContent = "awaiting first tap";
   } else if (remainingLaps === 0) {
     dueEl.textContent = "—";
     dueNote.textContent = "all segments complete";
@@ -208,18 +142,18 @@ function render(cfg, allRows) {
 
   // Last segment + status
   if (done > 0) {
-    const last = segments[segments.length - 1].t;
+    const last = laps[laps.length - 1].t;
     const since = now - last;
     document.getElementById("last-summit").textContent = fmtDur(since) + " ago";
     const isResting = since > REST_MIN * 60_000;
     document.getElementById("status").textContent = isResting ? `Resting — ${fmtDur(since)}` : "Active";
   } else {
     document.getElementById("last-summit").textContent = "—";
-    document.getElementById("status").textContent = !start ? "awaiting start tap" : "waiting for segment 1";
+    document.getElementById("status").textContent = "awaiting first tap";
   }
 
-  renderDupes(allRows);
-  renderChart(start, cutoff, total, segments, now);
+  renderDupes(laps);
+  renderChart(start, cutoff, total, laps, now);
 
   document.getElementById("updated").textContent =
     "updated " + now.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
@@ -231,40 +165,32 @@ function renderDupes(laps) {
   const pairs = [];
   for (let i = 1; i < laps.length; i++) {
     const gap = (laps[i].t - laps[i-1].t) / 1000;
-    if (gap < DUP_SEC) pairs.push({ a: i, b: i + 1, gap });
+    if (gap < DUP_SEC) pairs.push({ a: i, b: i + 1, gap, id: laps[i].id });
   }
   if (pairs.length === 0) { wrap.hidden = true; wrap.innerHTML = ""; return; }
   wrap.hidden = false;
   wrap.innerHTML = `
     <div class="k">POSSIBLE DUPLICATE${pairs.length > 1 ? "S" : ""}</div>
-    <div class="v">${pairs.map(p => `row ${p.a} &amp; ${p.b} <span class="thin">(${p.gap.toFixed(0)}s apart)</span>`).join("<br>")}</div>
-    <div class="note">If accidental, delete the extra row in the Sheets iOS app.</div>
+    <div class="v">${pairs.map(p => `row ${p.a} &amp; ${p.b} <span class="thin">(${p.gap.toFixed(0)}s apart, id ${p.id})</span>`).join("<br>")}</div>
+    <div class="note">If accidental, POST {"id":${pairs[0].id}} to /lap/delete with the bearer token.</div>
   `;
 }
 
-function renderChart(start, cutoff, total, segments, now) {
+function renderChart(start, cutoff, total, laps, now) {
   const ctx = document.getElementById("chart");
 
-  // Pre-start: render an empty chart frame so the canvas isn't a blank gap.
   if (!start || !cutoff) {
-    if (chart) {
-      chart.data.datasets = [];
-      chart.update("none");
-    }
+    if (chart) { chart.data.datasets = []; chart.update("none"); }
     return;
   }
 
-  // Step series: at each segment timestamp, cumulative count jumps to N.
   const stepPts = [{ x: start, y: 0 }];
-  segments.forEach((lap, i) => {
-    stepPts.push({ x: lap.t, y: i });       // hold previous value to this point
-    stepPts.push({ x: lap.t, y: i + 1 });   // then jump
+  laps.forEach((lap, i) => {
+    stepPts.push({ x: lap.t, y: i });
+    stepPts.push({ x: lap.t, y: i + 1 });
   });
-  // Extend horizontal line to "now" so the curve shows current standing.
-  if (segments.length > 0 && now > segments[segments.length - 1].t) {
-    stepPts.push({ x: now, y: segments.length });
-  } else if (segments.length === 0 && now > start) {
-    stepPts.push({ x: now, y: 0 });
+  if (laps.length > 0 && now > laps[laps.length - 1].t) {
+    stepPts.push({ x: now, y: laps.length });
   }
 
   const required = [{ x: start, y: 0 }, { x: cutoff, y: total }];
@@ -332,28 +258,19 @@ function renderChart(start, cutoff, total, segments, now) {
   });
 }
 
-// ---------- sim banner ----------
-
 function installSimBanner() {
-  if (!SIM_NAME && !SIM_NOW) return;
+  if (!SIM_NOW) return;
   const b = document.createElement("div");
   b.id = "sim-banner";
-  const parts = [];
-  if (SIM_NAME) parts.push(`SIM: ${SIM_NAME}`);
-  if (SIM_NOW) parts.push(`now = ${SIM_NOW.toLocaleString([], { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}`);
-  b.innerHTML = parts.join(" · ") + ' · <a href="./">exit</a>';
+  b.innerHTML = `now = ${SIM_NOW.toLocaleString([], { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })} · <a href="./">exit</a>`;
   document.body.prepend(b);
 }
 installSimBanner();
 
 // ---------- Web Push subscribe ----------
-//
-// Standard Web Push API: registers our service worker, asks for permission,
-// calls pushManager.subscribe() with our VAPID public key, POSTs the resulting
-// subscription to the Worker.
 
 async function installPushSubscribe() {
-  if (SIM_NAME || SIM_NOW) return;
+  if (SIM_NOW) return;
   if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
   if (!VAPID_PUBLIC_KEY || VAPID_PUBLIC_KEY.startsWith("REPLACE_WITH")) return;
 
@@ -361,12 +278,8 @@ async function installPushSubscribe() {
   if (!btn) return;
 
   let reg;
-  try {
-    reg = await navigator.serviceWorker.register("./sw.js");
-  } catch (e) {
-    console.error("SW register failed", e);
-    return;
-  }
+  try { reg = await navigator.serviceWorker.register("./sw.js"); }
+  catch (e) { console.error("SW register failed", e); return; }
 
   const refresh = async () => {
     const sub = await reg.pushManager.getSubscription();
@@ -385,7 +298,7 @@ async function installPushSubscribe() {
     try {
       const existing = await reg.pushManager.getSubscription();
       if (existing) {
-        await fetch(PUSH_WORKER_URL + "/unsubscribe", {
+        await fetch(WORKER_URL + "/unsubscribe", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ endpoint: existing.endpoint }),
@@ -398,14 +311,11 @@ async function installPushSubscribe() {
           userVisibleOnly: true,
           applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
         });
-        const json = sub.toJSON();
-        await fetch(PUSH_WORKER_URL + "/subscribe", {
+        const j = sub.toJSON();
+        await fetch(WORKER_URL + "/subscribe", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            endpoint: json.endpoint,
-            keys: { p256dh: json.keys.p256dh, auth: json.keys.auth },
-          }),
+          body: JSON.stringify({ endpoint: j.endpoint, keys: { p256dh: j.keys.p256dh, auth: j.keys.auth } }),
         });
       }
       await refresh();
@@ -435,13 +345,8 @@ installPushSubscribe();
 
 async function tick() {
   try {
-    const [cfgRows, lapRows] = await Promise.all([
-      fetchCsv(CONFIG_CSV_URL),
-      fetchCsv(LAPS_CSV_URL),
-    ]);
-    const cfg  = configFromCsv(cfgRows);
-    const laps = lapsFromCsv(lapRows);
-    render(cfg, laps);
+    const laps = await fetchLaps();
+    render(CONFIG, laps);
   } catch (e) {
     console.error(e);
     document.getElementById("updated").textContent = "fetch error — retrying";
