@@ -150,6 +150,25 @@ footer .thin { opacity: 0.6; margin-top: 2px; font-size: 11px; }
 .push-btn:active { background: var(--panel-2); }
 .push-btn.subscribed { color: var(--good); border-color: rgba(74, 222, 128, 0.3); }
 
+.start-btn {
+  display: block;
+  width: 100%;
+  margin: 0 0 16px;
+  padding: 22px 16px;
+  background: var(--good);
+  border: none;
+  border-radius: 18px;
+  color: #062514;
+  font-family: inherit;
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  box-shadow: 0 4px 24px rgba(74, 222, 128, 0.25);
+}
+.start-btn:active { transform: scale(0.98); }
+.start-btn:disabled { opacity: 0.55; }
+
 #sim-banner {
   background: #2a1f00;
   color: #ffd57a;

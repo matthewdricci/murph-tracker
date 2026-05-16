@@ -24,10 +24,11 @@ const DUP_SEC    = 20;      // segments closer than this look like accidental do
 //     Miles are still logged and labeled, but they're bookends, not the count.
 //   - Cutoff = start + target_duration_min (full workout window, miles included).
 const CONFIG = {
-  target_duration_min: 90,
-  total_segments:      22,  // total taps in the workout (mile-1 + 20 rounds + mile-2)
-  hero_total:          20,  // what to display as the "chip away" number (rounds only)
-  hero_offset:         1,   // segments to skip before hero counting begins (skip mile-1)
+  target_duration_min: 90,  // workout window end (start + this = mile-2 deadline)
+  rounds_target_min:   50,  // by this mark all 20 rounds + mile-1 should be done — drives chart & pace math
+  total_segments:      22,
+  hero_total:          20,
+  hero_offset:         1,
   athlete_name:        "Matt Ricci",
 };
 
@@ -87,14 +88,17 @@ let chart = null;
 
 function render(cfg, allRows) {
   const now = getNow();
-  const targetMs = cfg.target_duration_min * 60_000;
 
   // Split start markers from segment taps.
   const startRow = allRows.find(r => r.note === 'start') || null;
   const segments = allRows.filter(r => r.note !== 'start');
 
   const start = startRow ? startRow.t : (segments[0]?.t || null);
-  const cutoff = start ? new Date(start.getTime() + targetMs) : null;
+  // ROUND cutoff = the deadline for finishing all 20 rounds (and mile-1).
+  // WORKOUT cutoff = the deadline for finishing mile-2.
+  // All round-pace math uses the round cutoff; "TO TARGET" shows the workout cutoff.
+  const cutoff      = start ? new Date(start.getTime() + cfg.rounds_target_min   * 60_000) : null;
+  const workoutEnd  = start ? new Date(start.getTime() + cfg.target_duration_min * 60_000) : null;
 
   // Total in the hero/chart is rounds-only (cfg.hero_total = 20).
   // "done" here = rounds done. Mile-1 doesn't count (offset=1); mile-2 happens after the count hits 20.
@@ -105,6 +109,7 @@ function render(cfg, allRows) {
   const elapsedMs = start ? (now - start) : null;
   const cutoffMs  = cutoff ? (cutoff - now) : null;
 
+  updateStartButton(!!startRow);
   document.getElementById("title").textContent = `Murph — ${cfg.athlete_name}`;
   document.getElementById("subtitle").textContent = phaseLabel(startRow, segmentsDone, cfg.total_segments);
   document.getElementById("laps-done").textContent  = done;
@@ -115,8 +120,9 @@ function render(cfg, allRows) {
   document.getElementById("percent").textContent = pct.toFixed(1) + "%";
   document.getElementById("progress-bar").style.width = Math.min(100, pct) + "%";
 
+  const workoutEndMs = workoutEnd ? (workoutEnd - now) : null;
   document.getElementById("elapsed").textContent   = start ? fmtDur(Math.max(0, elapsedMs)) : "awaiting start tap";
-  document.getElementById("remaining").textContent = !start ? "—" : cutoffMs > 0 ? fmtDur(cutoffMs) : "TARGET PASSED";
+  document.getElementById("remaining").textContent = !start ? "—" : workoutEndMs > 0 ? fmtDur(workoutEndMs) : "WORKOUT END PASSED";
 
   // Pace math operates on the rounds-only count.
   const budgetMs = remainingLaps > 0 && cutoffMs != null && cutoffMs > 0 ? cutoffMs / remainingLaps : null;
@@ -396,6 +402,67 @@ function urlBase64ToUint8Array(base64String) {
 }
 
 installPushSubscribe();
+
+// ---------- Start button ----------
+//
+// One-time tap at GO. POSTs /lap with note='start'. Auth secret prompted once
+// then cached in localStorage. Button is shown only when no start row exists.
+
+const startBtn = document.getElementById("start-btn");
+let lastStartShown = null;  // last state we drove the button to, to avoid flicker
+
+function updateStartButton(hasStart) {
+  if (!startBtn) return;
+  if (hasStart === lastStartShown) return;
+  lastStartShown = hasStart;
+  startBtn.hidden = !!hasStart;
+}
+
+async function onStartClick() {
+  let secret = localStorage.getItem("notify_secret");
+  if (!secret) {
+    secret = prompt("Paste NOTIFY_SECRET (one-time, stored locally on this device):");
+    if (!secret) return;
+    localStorage.setItem("notify_secret", secret.trim());
+    secret = secret.trim();
+  }
+
+  startBtn.disabled = true;
+  startBtn.textContent = "Starting…";
+  try {
+    const r = await fetch(WORKER_URL + "/lap", {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + secret, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        event: "murph",
+        note: "start",
+        push: true,
+        push_total: 22,
+        push_title: "Murph",
+        push_body: "Murph started 🏃",
+        push_url: location.href,
+      }),
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      if (r.status === 401) {
+        localStorage.removeItem("notify_secret");
+        alert("Auth failed — secret was wrong. Tap Start again to re-enter.");
+      } else {
+        alert("Start failed (" + r.status + "): " + txt);
+      }
+      return;
+    }
+    await tick();  // immediate refresh
+  } catch (e) {
+    alert("Start failed: " + (e.message || e));
+  } finally {
+    startBtn.disabled = false;
+    startBtn.textContent = "▶ Start Murph";
+  }
+}
+
+if (startBtn) startBtn.addEventListener("click", onStartClick);
 
 // ---------- main loop ----------
 
