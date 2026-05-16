@@ -16,11 +16,18 @@ const REST_MIN   = 10;      // minutes between segments before status flips to "
 const DUP_SEC    = 20;      // segments closer than this look like accidental double-taps
 
 // Static config. No remote config tab anymore — these change rarely and live with the code.
-// Semantic model: every tap = +1 segment. First tap's timestamp = start.
-// Cutoff = start + target_duration_min. Done = laps.length.
+//
+// Semantic model:
+//   - A row with note='start' marks the workout start.
+//   - All other rows are segments (mile-1 = 1, rounds = 2..21, mile-2 = 22).
+//   - HERO + CHART only count the 20 Cindy rounds — the "chip away" surface.
+//     Miles are still logged and labeled, but they're bookends, not the count.
+//   - Cutoff = start + target_duration_min (full workout window, miles included).
 const CONFIG = {
   target_duration_min: 90,
-  total_laps:          22,
+  total_segments:      22,  // total taps in the workout (mile-1 + 20 rounds + mile-2)
+  hero_total:          20,  // what to display as the "chip away" number (rounds only)
+  hero_offset:         1,   // segments to skip before hero counting begins (skip mile-1)
   athlete_name:        "Matt Ricci",
 };
 
@@ -60,25 +67,46 @@ function fmtDur(ms) {
   return `${sign}${m}m ${pad(s)}s`;
 }
 
+// Map segment count → human phase label (shown as subtitle).
+function phaseLabel(startRow, segmentsDone, totalSegments) {
+  if (!startRow && segmentsDone === 0) return "awaiting start tap";
+  if (segmentsDone === 0)               return "in Mile 1";
+  if (segmentsDone === 1)               return "Mile 1 done · awaiting Round 1";
+  if (segmentsDone >= 2 && segmentsDone <= 20) {
+    const justFinished = segmentsDone - 1;
+    return `Round ${justFinished} done · ${20 - justFinished} rounds to go`;
+  }
+  if (segmentsDone === 21)              return "All 20 rounds done · in Mile 2";
+  if (segmentsDone >= totalSegments)    return "FINISHED 🎉";
+  return "";
+}
+
 // ---------- render ----------
 
 let chart = null;
 
-function render(cfg, laps) {
+function render(cfg, allRows) {
   const now = getNow();
-  const total = cfg.total_laps;
   const targetMs = cfg.target_duration_min * 60_000;
 
-  // Semantic: every tap is a segment. Start = first tap's timestamp.
-  const start = laps.length > 0 ? laps[0].t : null;
+  // Split start markers from segment taps.
+  const startRow = allRows.find(r => r.note === 'start') || null;
+  const segments = allRows.filter(r => r.note !== 'start');
+
+  const start = startRow ? startRow.t : (segments[0]?.t || null);
   const cutoff = start ? new Date(start.getTime() + targetMs) : null;
 
-  const done = laps.length;
+  // Total in the hero/chart is rounds-only (cfg.hero_total = 20).
+  // "done" here = rounds done. Mile-1 doesn't count (offset=1); mile-2 happens after the count hits 20.
+  const segmentsDone = segments.length;
+  const total = cfg.hero_total;
+  const done = Math.max(0, Math.min(total, segmentsDone - cfg.hero_offset));
   const remainingLaps = Math.max(0, total - done);
   const elapsedMs = start ? (now - start) : null;
   const cutoffMs  = cutoff ? (cutoff - now) : null;
 
-  document.getElementById("title").textContent = `Murph Test — ${cfg.athlete_name}`;
+  document.getElementById("title").textContent = `Murph — ${cfg.athlete_name}`;
+  document.getElementById("subtitle").textContent = phaseLabel(startRow, segmentsDone, cfg.total_segments);
   document.getElementById("laps-done").textContent  = done;
   document.getElementById("laps-total").textContent = total;
   document.getElementById("elevation").hidden = true;
@@ -87,13 +115,12 @@ function render(cfg, laps) {
   document.getElementById("percent").textContent = pct.toFixed(1) + "%";
   document.getElementById("progress-bar").style.width = Math.min(100, pct) + "%";
 
-  document.getElementById("elapsed").textContent   = start ? fmtDur(Math.max(0, elapsedMs)) : "awaiting first tap";
+  document.getElementById("elapsed").textContent   = start ? fmtDur(Math.max(0, elapsedMs)) : "awaiting start tap";
   document.getElementById("remaining").textContent = !start ? "—" : cutoffMs > 0 ? fmtDur(cutoffMs) : "TARGET PASSED";
 
+  // Pace math operates on the rounds-only count.
   const budgetMs = remainingLaps > 0 && cutoffMs != null && cutoffMs > 0 ? cutoffMs / remainingLaps : null;
-  const actualMs = done > 1 && elapsedMs > 0 ? elapsedMs / (done - 1) : null;
-  // ^ pace uses (done - 1) intervals between done timestamps, not done.
-  // At done=1 the elapsed is 0 (tap 1 IS the start), so no pace yet.
+  const actualMs = done > 0 && elapsedMs > 0 ? elapsedMs / done : null;
 
   // BUFFER
   const bufferBox  = document.getElementById("buffer-box");
@@ -102,57 +129,57 @@ function render(cfg, laps) {
   bufferBox.classList.remove("good", "bad");
   if (!start) {
     bufferEl.textContent = "—";
-    bufferNote.textContent = "tap to log first segment";
-  } else if (done < 2 || actualMs == null) {
+    bufferNote.textContent = "tap Start to begin";
+  } else if (done === 0 || actualMs == null) {
     bufferEl.textContent = "—";
-    bufferNote.textContent = "starts updating after segment 2";
+    bufferNote.textContent = "starts updating after Round 1";
   } else if (remainingLaps === 0) {
-    bufferEl.textContent = "FINISHED";
+    bufferEl.textContent = "RDS DONE";
     bufferBox.classList.add("good");
-    bufferNote.textContent = "at " + laps[laps.length-1].t.toLocaleString([], { hour: "numeric", minute: "2-digit" });
+    bufferNote.textContent = "all 20 rounds at " + segments[segments.length-1].t.toLocaleString([], { hour: "numeric", minute: "2-digit" });
   } else if (cutoffMs <= 0) {
     bufferEl.textContent = "TARGET PASSED";
     bufferBox.classList.add("bad");
-    bufferNote.textContent = `${done}/${total} segments completed`;
+    bufferNote.textContent = `${done}/${total} rounds completed`;
   } else {
     const projectedFinish = new Date(now.getTime() + remainingLaps * actualMs);
     const buf = cutoff - projectedFinish;
     bufferEl.textContent = (buf >= 0 ? "+" : "−") + fmtDur(Math.abs(buf)) + (buf >= 0 ? " ahead" : " behind");
     bufferBox.classList.add(buf >= 0 ? "good" : "bad");
-    bufferNote.textContent = "projected finish " + projectedFinish.toLocaleString([], { hour: "numeric", minute: "2-digit" });
+    bufferNote.textContent = "projected rounds-done " + projectedFinish.toLocaleString([], { hour: "numeric", minute: "2-digit" });
   }
 
-  // NEXT SEGMENT DUE BY
+  // NEXT ROUND DUE BY
   const dueEl  = document.getElementById("due-by");
   const dueNote = document.getElementById("due-note");
   if (!start) {
     dueEl.textContent = "—";
-    dueNote.textContent = "awaiting first tap";
+    dueNote.textContent = "awaiting start tap";
   } else if (remainingLaps === 0) {
     dueEl.textContent = "—";
-    dueNote.textContent = "all segments complete";
+    dueNote.textContent = "all rounds complete";
   } else if (cutoffMs <= 0) {
     dueEl.textContent = "—";
     dueNote.textContent = "target passed";
   } else {
     const dueAt = new Date(now.getTime() + budgetMs);
     dueEl.textContent = dueAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-    dueNote.textContent = `${fmtDur(budgetMs)} from now — your running budget`;
+    dueNote.textContent = `${fmtDur(budgetMs)} from now — round budget`;
   }
 
-  // Last segment + status
-  if (done > 0) {
-    const last = laps[laps.length - 1].t;
+  // Last segment + status (uses raw segments, not rounds-only — so mile taps register)
+  if (segmentsDone > 0) {
+    const last = segments[segments.length - 1].t;
     const since = now - last;
     document.getElementById("last-summit").textContent = fmtDur(since) + " ago";
     const isResting = since > REST_MIN * 60_000;
     document.getElementById("status").textContent = isResting ? `Resting — ${fmtDur(since)}` : "Active";
   } else {
     document.getElementById("last-summit").textContent = "—";
-    document.getElementById("status").textContent = "awaiting first tap";
+    document.getElementById("status").textContent = start ? "in Mile 1" : "awaiting start tap";
   }
 
-  // For burn-down chart color: are we currently ahead (less remaining than required)?
+  // For burn-down chart color: are we currently ahead on rounds?
   let ahead = null;
   if (start && cutoff && done > 0 && cutoffMs > 0) {
     const requiredRemaining = total * (cutoff - now) / (cutoff - start);
@@ -160,8 +187,8 @@ function render(cfg, laps) {
     ahead = actualRemaining < requiredRemaining;
   }
 
-  renderDupes(laps);
-  renderChart(start, cutoff, total, laps, now, ahead);
+  renderDupes(segments);
+  renderChart(start, cutoff, total, segments, cfg.hero_offset, now, ahead);
 
   document.getElementById("updated").textContent =
     "updated " + now.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
@@ -184,7 +211,7 @@ function renderDupes(laps) {
   `;
 }
 
-function renderChart(start, cutoff, total, laps, now, ahead) {
+function renderChart(start, cutoff, total, segments, heroOffset, now, ahead) {
   const ctx = document.getElementById("chart");
 
   if (!start || !cutoff) {
@@ -192,14 +219,25 @@ function renderChart(start, cutoff, total, laps, now, ahead) {
     return;
   }
 
-  // Burn-down: stairsteps DOWN from total toward 0.
-  const stepPts = [{ x: start, y: total }];
-  laps.forEach((lap, i) => {
-    stepPts.push({ x: lap.t, y: total - i });
-    stepPts.push({ x: lap.t, y: total - (i + 1) });
+  // Burn-down: stairsteps DOWN from total (rounds remaining) toward 0.
+  // Only the round taps (segments[heroOffset..heroOffset+total-1]) drop the line.
+  // Mile-1 tap (segment 0) and Mile-2 tap (segment 21) DON'T drop the line — bookends.
+  let remaining = total;
+  const stepPts = [{ x: start, y: remaining }];
+  segments.forEach((seg, i) => {
+    const isRoundTap = i >= heroOffset && i < heroOffset + total;
+    if (isRoundTap) {
+      // Hold the previous value to this tap, then drop by 1.
+      stepPts.push({ x: seg.t, y: remaining });
+      remaining = remaining - 1;
+      stepPts.push({ x: seg.t, y: remaining });
+    } else {
+      // Mile bookends — line stays flat, but anchor a point at this timestamp.
+      stepPts.push({ x: seg.t, y: remaining });
+    }
   });
-  if (laps.length > 0 && now > laps[laps.length - 1].t) {
-    stepPts.push({ x: now, y: total - laps.length });
+  if (segments.length > 0 && now > segments[segments.length - 1].t) {
+    stepPts.push({ x: now, y: remaining });
   }
 
   // Required pace: diagonal from (start, total) → (cutoff, 0). Hitting zero = done in time.
