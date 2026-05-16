@@ -107,7 +107,9 @@ function render(cfg, allRows) {
   const elapsedMs = start ? (now - start) : null;
   const cutoffMs  = cutoff ? (cutoff - now) : null;
 
-  updateStartButton(!!startRow);
+  // Hide the Start button if EITHER an explicit start row exists OR any segment
+  // already came in (signal-loss fallback: the first lap implicitly starts the workout).
+  updateStartButton(!!startRow || segments.length > 0);
   document.getElementById("title").textContent = `Murph — ${cfg.athlete_name}`;
   document.getElementById("subtitle").textContent = phaseLabel(startRow, segmentsDone, cfg.total_segments);
   document.getElementById("laps-done").textContent  = done;
