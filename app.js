@@ -24,8 +24,9 @@ const DUP_SEC    = 20;      // segments closer than this look like accidental do
 //     Miles are still logged and labeled, but they're bookends, not the count.
 //   - Cutoff = start + target_duration_min (full workout window, miles included).
 const CONFIG = {
-  target_duration_min: 90,  // workout window end (start + this = mile-2 deadline)
-  rounds_target_min:   50,  // by this mark all 20 rounds + mile-1 should be done — drives chart & pace math
+  // Single anchor: by this mark, Mile-1 + all 20 rounds should be done.
+  // Mile-2 happens after with no deadline pressure — it's just the cooldown run.
+  rounds_target_min:   50,
   total_segments:      22,
   hero_total:          20,
   hero_offset:         1,
@@ -94,11 +95,8 @@ function render(cfg, allRows) {
   const segments = allRows.filter(r => r.note !== 'start');
 
   const start = startRow ? startRow.t : (segments[0]?.t || null);
-  // ROUND cutoff = the deadline for finishing all 20 rounds (and mile-1).
-  // WORKOUT cutoff = the deadline for finishing mile-2.
-  // All round-pace math uses the round cutoff; "TO TARGET" shows the workout cutoff.
-  const cutoff      = start ? new Date(start.getTime() + cfg.rounds_target_min   * 60_000) : null;
-  const workoutEnd  = start ? new Date(start.getTime() + cfg.target_duration_min * 60_000) : null;
+  // Single cutoff = round target. Mile-2 is post-target cooldown, no deadline.
+  const cutoff = start ? new Date(start.getTime() + cfg.rounds_target_min * 60_000) : null;
 
   // Total in the hero/chart is rounds-only (cfg.hero_total = 20).
   // "done" here = rounds done. Mile-1 doesn't count (offset=1); mile-2 happens after the count hits 20.
@@ -120,9 +118,12 @@ function render(cfg, allRows) {
   document.getElementById("percent").textContent = pct.toFixed(1) + "%";
   document.getElementById("progress-bar").style.width = Math.min(100, pct) + "%";
 
-  const workoutEndMs = workoutEnd ? (workoutEnd - now) : null;
   document.getElementById("elapsed").textContent   = start ? fmtDur(Math.max(0, elapsedMs)) : "awaiting start tap";
-  document.getElementById("remaining").textContent = !start ? "—" : workoutEndMs > 0 ? fmtDur(workoutEndMs) : "WORKOUT END PASSED";
+  // "TO ROUND TARGET" — countdown to the 50-min mark. Goes negative when over (shown as "+Xm over").
+  document.getElementById("remaining").textContent =
+    !start            ? "—"
+    : cutoffMs >  0   ? fmtDur(cutoffMs)
+    :                   "+" + fmtDur(Math.abs(cutoffMs)) + " over";
 
   // Pace math operates on the rounds-only count.
   const budgetMs = remainingLaps > 0 && cutoffMs != null && cutoffMs > 0 ? cutoffMs / remainingLaps : null;
